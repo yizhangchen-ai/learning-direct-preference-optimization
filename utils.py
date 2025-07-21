@@ -1,3 +1,5 @@
+"""辅助函数集合，包含分布式初始化、文件路径处理等工具。"""
+
 import os
 import getpass
 from datetime import datetime
@@ -13,12 +15,15 @@ from typing import Dict, Union, Type, List
 
 
 def get_open_port():
+    """在本机上找到一个空闲端口。"""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(('', 0)) # bind to all interfaces and use an OS provided port
-        return s.getsockname()[1] # return only the port number
+        # 绑定到随机端口并立即返回该端口号
+        s.bind(('', 0))
+        return s.getsockname()[1]
 
 
 def get_remote_file(remote_path, local_path=None):
+    """从远程机器拷贝文件到本地，如已在本地则直接返回路径。"""
     hostname, path = remote_path.split(':')
     local_hostname = socket.gethostname()
     if hostname == local_hostname or hostname == local_hostname[:local_hostname.find('.')]:
@@ -38,13 +43,13 @@ def get_remote_file(remote_path, local_path=None):
 
 
 def rank0_print(*args, **kwargs):
-    """Print, but only on rank 0."""
+    """仅在 rank0 进程打印日志。"""
     if not dist.is_initialized() or dist.get_rank() == 0:
         print(*args, **kwargs)
 
 
 def get_local_dir(prefixes_to_resolve: List[str]) -> str:
-    """Return the path to the cache directory for this user."""
+    """根据给定的本地目录前缀，返回当前用户的缓存目录路径。"""
     for prefix in prefixes_to_resolve:
         if os.path.exists(prefix):
             return f"{prefix}/{getpass.getuser()}"
@@ -53,7 +58,7 @@ def get_local_dir(prefixes_to_resolve: List[str]) -> str:
     
 
 def get_local_run_dir(exp_name: str, local_dirs: List[str]) -> str:
-    """Create a local directory to store outputs for this run, and return its path."""
+    """为当前实验创建唯一的输出目录并返回其路径。"""
     now = datetime.now()
     timestamp = now.strftime("%Y-%m-%d_%H-%M-%S_%f")
     run_dir = f"{get_local_dir(local_dirs)}/{exp_name}_{timestamp}"
@@ -62,7 +67,7 @@ def get_local_run_dir(exp_name: str, local_dirs: List[str]) -> str:
 
 
 def slice_and_move_batch_for_device(batch: Dict, rank: int, world_size: int, device: str) -> Dict:
-    """Slice a batch into chunks, and move each chunk to the specified device."""
+    """将批次切分到不同进程，并移动到指定设备上。"""
     chunk_size = len(list(batch.values())[0]) // world_size
     start = chunk_size * rank
     end = chunk_size * (rank + 1)
@@ -72,6 +77,7 @@ def slice_and_move_batch_for_device(batch: Dict, rank: int, world_size: int, dev
 
 
 def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float], dim: int = -1) -> torch.Tensor:
+    """在指定维度上将张量填充到给定长度。"""
     if tensor.size(dim) >= length:
         return tensor
     else:
@@ -81,7 +87,7 @@ def pad_to_length(tensor: torch.Tensor, length: int, pad_value: Union[int, float
 
 
 def all_gather_if_needed(values: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
-    """Gather and stack/cat values from all processes, if there are multiple processes."""
+    """在多进程环境下收集并拼接所有进程的张量。"""
     if world_size == 1:
         return values
 
@@ -92,19 +98,19 @@ def all_gather_if_needed(values: torch.Tensor, rank: int, world_size: int) -> to
 
 
 def formatted_dict(d: Dict) -> Dict:
-    """Format a dictionary for printing."""
+    """将字典中的浮点数格式化为更简洁的字符串表示。"""
     return {k: (f"{v:.5g}" if type(v) == float else v) for k, v in d.items()}
     
 
 def disable_dropout(model: torch.nn.Module):
-    """Disable dropout in a model."""
+    """关闭模型中所有 Dropout 层，避免推理/评测阶段的随机性。"""
     for module in model.modules():
         if isinstance(module, torch.nn.Dropout):
             module.p = 0
 
 
 def print_gpu_memory(rank: int = None, message: str = ''):
-    """Print the amount of GPU memory currently allocated for each GPU."""
+    """打印当前进程占用的 GPU 显存，方便调试内存问题。"""
     if torch.cuda.is_available():
         device_count = torch.cuda.device_count()
         for i in range(device_count):
@@ -118,7 +124,7 @@ def print_gpu_memory(rank: int = None, message: str = ''):
 
 
 def get_block_class_from_model(model: torch.nn.Module, block_class_name: str) -> torch.nn.Module:
-    """Get the class of a block from a model, using the block's class name."""
+    """根据名称在模型中查找对应的模块类。"""
     for module in model.modules():
         if module.__class__.__name__ == block_class_name:
             return module.__class__
@@ -126,6 +132,7 @@ def get_block_class_from_model(model: torch.nn.Module, block_class_name: str) ->
 
 
 def get_block_class_from_model_class_and_block_name(model_class: Type, block_class_name: str) -> Type:
+    """根据模型类文件动态加载并返回指定的模块类。"""
     filepath = inspect.getfile(model_class)
     assert filepath.endswith('.py'), f"Expected a .py file, got {filepath}"
     assert os.path.exists(filepath), f"File {filepath} does not exist"
@@ -146,6 +153,7 @@ def get_block_class_from_model_class_and_block_name(model_class: Type, block_cla
 
 
 def init_distributed(rank: int, world_size: int, master_addr: str = 'localhost', port: int = 12355, backend: str = 'nccl'):
+    """初始化分布式环境，设置地址与端口并指定 GPU。"""
     print(rank, 'initializing distributed')
     os.environ["MASTER_ADDR"] = master_addr
     os.environ["MASTER_PORT"] = str(port)
@@ -154,22 +162,24 @@ def init_distributed(rank: int, world_size: int, master_addr: str = 'localhost',
 
 
 class TemporarilySeededRandom:
+    """上下文管理器：在进入时设置随机种子，退出时恢复原状态。"""
+
     def __init__(self, seed):
-        """Temporarily set the random seed, and then restore it when exiting the context."""
+        # 记录种子及原始随机状态
         self.seed = seed
         self.stored_state = None
         self.stored_np_state = None
 
     def __enter__(self):
-        # Store the current random state
+        # 保存进入前的随机状态
         self.stored_state = random.getstate()
         self.stored_np_state = np.random.get_state()
 
-        # Set the random seed
+        # 设置新的随机种子
         random.seed(self.seed)
         np.random.seed(self.seed)
 
     def __exit__(self, exc_type, exc_value, traceback):
-        # Restore the random state
+        # 恢复之前保存的随机状态
         random.setstate(self.stored_state)
         np.random.set_state(self.stored_np_state)

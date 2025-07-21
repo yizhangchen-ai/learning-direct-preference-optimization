@@ -1,3 +1,5 @@
+"""实现 SFT/DPO 等训练流程的各类 Trainer。"""
+
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 import torch.nn.functional as F
@@ -50,7 +52,7 @@ def preference_loss(policy_chosen_logps: torch.FloatTensor,
                     label_smoothing: float = 0.0,
                     ipo: bool = False,
                     reference_free: bool = False) -> Tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
-    """Compute the DPO loss for a batch of policy and reference model log probabilities.
+    """计算 DPO/IPO 损失并返回奖励。
 
     Args:
         policy_chosen_logps: Log probabilities of the policy model for the chosen responses. Shape: (batch_size,)
@@ -116,7 +118,7 @@ def _get_batch_logps(logits: torch.FloatTensor, labels: torch.LongTensor, averag
 
 
 def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict[str, torch.LongTensor]:
-    """Concatenate the chosen and rejected inputs into a single tensor.
+    """将正样本和负样本拼接成一次前向所需的输入，减少模型调用次数。
     
     Args:
         batch: A batch of data. Must contain the keys 'chosen_input_ids' and 'rejected_input_ids', which are tensors of shape (batch_size, sequence_length).
@@ -144,11 +146,9 @@ def concatenated_inputs(batch: Dict[str, Union[List, torch.LongTensor]]) -> Dict
 
 class BasicTrainer(object):
     def __init__(self, policy: nn.Module, config: DictConfig, seed: int, run_dir: str, reference_model: Optional[nn.Module] = None, rank: int = 0, world_size: int = 1):
-        """A trainer for a language model, supporting either SFT or DPO training.
-           
-           If multiple GPUs are present, naively splits the model across them, effectively
-           offering N times available memory, but without any parallel computation.
-        """
+        """基础 Trainer，支持单机多卡的简单切分。"""
+
+        # 若使用多 GPU，但不启用并行计算，则按块划分模型到不同设备
         self.seed = seed
         self.rank = rank
         self.world_size = world_size
@@ -169,6 +169,7 @@ class BasicTrainer(object):
             max_prompt_length=config.max_prompt_length,
             sft_mode=config.loss.name == 'sft',
         )
+        # 构建训练和评估数据迭代器
 
         self.policy = policy
         self.reference_model = reference_model
@@ -270,7 +271,7 @@ class BasicTrainer(object):
         return losses.mean(), metrics
 
     def train(self):
-        """Begin either SFT or DPO training, with periodic evaluation."""
+        """开始主训练循环，定期进行评估和模型保存。"""
 
         rank0_print(f'Using {self.config.optimizer} optimizer')
         self.optimizer = getattr(torch.optim, self.config.optimizer)(self.policy.parameters(), lr=self.config.lr)
