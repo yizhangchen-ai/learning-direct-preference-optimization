@@ -1,3 +1,12 @@
+"""\
+偏好数据集加载和批处理相关工具。
+
+本文件负责从 HuggingFace 下载不同的偏好数据集（例如
+Anthropic-HH、Stanford Human Preferences、StackExchange 等），
+并统一整理成 `(prompt, responses, pairs, sft_target)` 的结构，
+同时提供批次迭代器以供训练和评测使用。
+"""
+
 import datasets
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -13,6 +22,8 @@ from typing import Dict, List, Optional, Iterator, Callable, Union, Tuple
 
 def extract_anthropic_prompt(prompt_and_response):
     """Extract the anthropic prompt from a prompt and response pair."""
+    # Anthropic 数据集中 prompt 与回复拼接在一起，本函数用于截取
+    # "\n\nAssistant:" 之前的内容作为纯 prompt。
     search_term = '\n\nAssistant:'
     search_term_idx = prompt_and_response.rfind(search_term)
     assert search_term_idx != -1, f"Prompt and response does not contain '{search_term}'"
@@ -21,6 +32,8 @@ def extract_anthropic_prompt(prompt_and_response):
 
 def strip_html_tags(html_string):
     """Strip HTML tags from a string, except for <code> tags (which contain real code in the StackExchange answers)."""
+    # SE 数据集的回答包含 HTML，本函数用于去除除 <code> 外的所有标签
+    # 保留代码块内容，方便后续进行纯文本处理。
     # Create a BeautifulSoup object
     soup = BeautifulSoup(html_string, 'html.parser')
 
@@ -45,9 +58,11 @@ def strip_html_tags(html_string):
 
 def get_se(split, silent=False, cache_dir: str = None) -> Dict[str, Dict[str, Union[List[Tuple[int, int]], List[str], str]]]:
     """Load the StackExchange dataset from Huggingface, and return a dict of prompts and responses. See get_hh for the format.
-    
+
        We strip the HTML tags from the responses (except for <code> tags), and we add necessary newlines.
     """
+    # 载入 StackExchange 偏好数据，并转换成统一格式。
+    # 数据集较大，这里仅取 1% 作为测试集，其余为训练集。
     print(f'Loading SE dataset ({split} split) from Huggingface...')
     dataset = datasets.load_dataset('HuggingFaceH4/stack-exchange-preferences', cache_dir=cache_dir)['train']
     print('done')
@@ -88,6 +103,8 @@ def get_shp(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str
        We filter preference pairs to only keep pairs where the score ratio is at least 2.
        For this dataset, the sft_target is the response with the highest score.
     """
+    # 载入斯坦福偏好数据集，并过滤分值差距过小的样本，
+    # 将每个 prompt 转换成统一格式后返回。
     print(f'Loading SHP dataset ({split} split) from Huggingface...')
     dataset = datasets.load_dataset('stanfordnlp/SHP', split=split, cache_dir=cache_dir)
     print('done')
@@ -138,6 +155,8 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
        
        For this dataset, the sft_target is just the chosen response.
     """
+    # 读取 Anthropic Helpful-Harmless 数据集，并将其整理为统一格式。
+    # 数据集的 prompt+response 合在一起存储，需要先拆分。
     print(f'Loading HH dataset ({split} split) from Huggingface...')
     dataset = datasets.load_dataset('Anthropic/hh-rlhf', split=split, cache_dir=cache_dir)
     print('done')
@@ -162,6 +181,7 @@ def get_hh(split: str, silent: bool = False, cache_dir: str = None) -> Dict[str,
 
 def get_dataset(name: str, split: str, silent: bool = False, cache_dir: str = None):
     """Load the given dataset by name. Supported by default are 'shp', 'hh', and 'se'."""
+    # 根据数据集名称分派到不同的加载函数
     if name == 'shp':
         data = get_shp(split, silent=silent, cache_dir=cache_dir)
     elif name == 'hh':
@@ -183,8 +203,9 @@ def get_collate_fn(tokenizer) -> Callable[[List[Dict]], Dict[str, Union[List, to
        The collate function takes a list of examples (dicts, where values are lists of
          ints [tokens] or strings [the original texts]) and returns a batch of examples,
          PyTorch tensors padded to the maximum length. Strings are passed through."""
+    # 返回一个用于 DataLoader 的 collate_fn，将不同长度的序列填充到同一长度
     def collate_fn(batch):
-        # first, pad everything to the same length
+        # 先将批次中所有字段按最大长度填充
         padded_batch = {}
         for k in batch[0].keys():
             if k.endswith('_input_ids') or k.endswith('_attention_mask') or k.endswith('_labels'):
@@ -222,6 +243,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
          the sum of the length of the prompt and the chosen/rejected response, with -100 for the
          prompt tokens.
     """
+    # 对三段文本分别进行分词，不添加特殊符号
     chosen_tokens = tokenizer(chosen, add_special_tokens=False)
     rejected_tokens = tokenizer(rejected, add_special_tokens=False)
     prompt_tokens = tokenizer(prompt, add_special_tokens=False)
@@ -252,7 +274,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
         chosen_tokens = {k: v[:max_length - max_prompt_length] for k, v in chosen_tokens.items()}
         rejected_tokens = {k: v[:max_length - max_prompt_length] for k, v in rejected_tokens.items()}
 
-    # Create labels
+    # 创建标签：prompt 部分在计算损失时被忽略，因此填入 -100
     chosen_sequence_tokens = {k: prompt_tokens[k] + chosen_tokens[k] for k in chosen_tokens}
     rejected_sequence_tokens = {k: prompt_tokens[k] + rejected_tokens[k] for k in rejected_tokens}
     chosen_sequence_tokens['labels'] = chosen_sequence_tokens['input_ids'][:]
@@ -273,7 +295,7 @@ def tokenize_batch_element(prompt: str, chosen: str, rejected: str, truncation_m
             if type_key == 'token_type_ids':
                 continue
             batch[f'{k}_{type_key}'] = tokens
-
+    # 返回包含分词结果及原始文本的字典，稍后由 collate_fn 处理为张量
     return batch
 
 
@@ -290,6 +312,7 @@ def get_batch_iterator(names: List[str],
                        seed:int = 0,
                        silent: bool = False,
                        cache_dir: Optional[str] = None) -> Iterator[Dict]:
+    """构造一个批次迭代器，可在训练或评估阶段按需产生数据。"""
     """Get an iterator over batches of data. Stops after n_epochs or n_examples, whichever comes first.
 
     Args:
@@ -307,12 +330,14 @@ def get_batch_iterator(names: List[str],
         silent: Whether to silence the progress bar(s).
         cache_dir: Directory to cache the datasets in.
     """
+    # 至少需要指定运行的 epoch 数或样本数量
     assert n_epochs is not None or n_examples is not None, "Must specify either n_epochs or n_examples"
     if silent:
         datasets.logging.disable_progress_bar()
         datasets.logging.set_verbosity_error()
 
     with TemporarilySeededRandom(seed):
+        # 为每个 epoch 随机生成打乱顺序所需的种子
         permutation_seeds = iter(np.random.randint(0, 2**32, size=1000000))
         flat_data = []
         for name in names:
@@ -335,10 +360,12 @@ def get_batch_iterator(names: List[str],
                 random.shuffle(flat_data)
 
         batch = []
+        # 遍历整理后的单个 prompt 数据，构建批次
         for prompt, responses, pairs, sft_target, truncation_mode in flat_data:
             if done:
                 break
             if sft_mode:
+                # SFT 模式下只需要正例文本，负例被忽略
                 batch_element = tokenize_batch_element(prompt, sft_target, sft_target, truncation_mode, tokenizer, max_length, max_prompt_length)
                 batch_element = {k: v for k, v in batch_element.items() if 'rejected' not in k}
                 batch.append(batch_element)
@@ -352,6 +379,7 @@ def get_batch_iterator(names: List[str],
 
                     batch = []
             else:
+                # DPO 模式下需要遍历每个偏好对 (chosen, rejected)
                 for p in pairs:
                     if done:
                         break
@@ -373,6 +401,7 @@ def get_batch_iterator(names: List[str],
 
 def strings_match_up_to_spaces(str_a: str, str_b: str) -> bool:
     """Returns True if str_a and str_b match up to spaces, False otherwise."""
+    # 用于忽略空格差异的字符串比较
     for idx in range(min(len(str_a), len(str_b)) - 2):
         if str_a[idx] != str_b[idx]:
             if str_a[idx] != ' ' and str_b[idx] != ' ':
